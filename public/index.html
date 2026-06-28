@@ -2160,6 +2160,20 @@ html.control-glass-svg-ok #visual-guide-btn:hover{
         <div class="fx-toggle" id="t-desktopLyricsHighlight" onclick="toggleFx('desktopLyricsHighlight')" title="桌面歌词按播放进度高亮"><span>桌面歌词高亮跟随</span><span class="dot"></span></div>
         <div class="fx-toggle dev-locked" id="t-wallpaperMode" onclick="toggleFx('wallpaperMode')" title="开发中，暂不可用"><span>壁纸模式<em class="fx-dev-badge">开发中</em></span><span class="dot"></span></div>
       </div>
+      <div class="fx-section-label">自动镜头</div>
+      <div class="fx-toggle-grid">
+        <div class="fx-toggle" id="t-autoOrbit" onclick="toggleFx('autoOrbit')" title="开启后相机按律动自动漂移视角，可三选一"><span>自动视角</span><span class="dot"></span></div>
+        <div class="fx-toggle" id="t-beatZoom" onclick="toggleFx('beatZoom')" title="开启后节拍来相机拉近、松开推远"><span>律动推拉</span><span class="dot"></span></div>
+      </div>
+      <div class="fx-section-label">视角漂移形态</div>
+      <div class="fx-seg" id="autoorbit-mode-seg" title="drift 平滑随机漂移 / wave 有机起伏循环">
+        <button data-autoorbit-mode="drift">随机漂移</button>
+        <button data-autoorbit-mode="wave">起伏循环</button>
+      </div>
+      <div class="fx-slider"><label>漂移强度</label><input id="fx-autoorbitspeed" type="range" min="0" max="2" step="0.01"><output></output></div>
+      <div class="fx-slider"><label>转角上限</label><input id="fx-autoorbitlimit" type="range" min="0" max="90" step="1"><output></output></div>
+      <div class="fx-slider"><label>歌词跟随</label><input id="fx-lyricfollow" type="range" min="0" max="1" step="0.01"><output></output></div>
+      <div class="fx-slider"><label>推拉幅度</label><input id="fx-beatzoomgain" type="range" min="0" max="2" step="0.01"><output></output></div>
       <div class="fx-section-label">桌面 / 壁纸</div>
       <div class="fx-slider"><label>桌面歌词大小</label><input id="fx-desktoplyricssize" type="range" min="0.72" max="1.55" step="0.01"><output></output></div>
       <div class="fx-slider"><label>桌面歌词透明</label><input id="fx-desktoplyricsopacity" type="range" min="0.28" max="1" step="0.01"><output></output></div>
@@ -3264,6 +3278,13 @@ var fxDefaults = {
   performanceBackground: 'auto',
   performanceQuality: 'high',
   liveBackgroundKeep: false,
+  autoOrbit: false,
+  autoOrbitMode: 'drift',
+  autoOrbitSpeed: 0.6,
+  autoOrbitLimit: 25,
+  lyricFollow: 0.35,
+  beatZoom: false,
+  beatZoomGain: 0.5,
   cam: 'off',
 };
 var PACKAGED_DEFAULT_USER_FX_ARCHIVE_NAME = '默认测试';
@@ -3331,6 +3352,13 @@ var PACKAGED_DEFAULT_FX_SNAPSHOT = Object.freeze({
   performanceBackground: 'auto',
   performanceQuality: 'high',
   liveBackgroundKeep: false,
+  autoOrbit: false,
+  autoOrbitMode: 'drift',
+  autoOrbitSpeed: 0.6,
+  autoOrbitLimit: 25,
+  lyricFollow: 0.35,
+  beatZoom: false,
+  beatZoomGain: 0.5,
   particleLyrics: true,
   backCover: false,
   shelf: 'side',
@@ -5055,6 +5083,11 @@ function updateCamera() {
     targetRadius= Math.max(orbit.minRadius, Math.min(orbit.maxRadius, orbit.userRadius + orbit.cineRadius));
     tLookAt = ZERO_VEC;
   }
+  // 律动推拉: 节拍来拉近 (独立于 fx.cinema, 直接作用 targetRadius; focus 跟拍时跳过)
+  if (fx.beatZoom && !fa) {
+    var beatZoomGain = clampRange(Number(fx.beatZoomGain) || 0, 0, 2);
+    targetRadius = Math.max(orbit.minRadius, Math.min(orbit.maxRadius, targetRadius - beatCam.radiusKick * beatZoomGain));
+  }
   // 丝滑变速: 线性 lerp 自然给出 "快→慢" 缓出曲线
   var focusEase = fa ? 0.16 : 0.10;
   var radiusEase = fa ? 0.12 : 0.07;
@@ -5206,6 +5239,123 @@ function setFocusZone(type, immediate) {
 var lastCamPunchAt = -10;
 var CAM_PUNCH_MIN_INTERVAL = 0.45;     // 秒
 var CAM_PUNCH_BEAT_THRESHOLD = 0.55;   // 必须够强才触发
+
+// 自动视角漂移状态机: 两形态 (drift 连续随机 / wave 有机起伏), 节拍加速漂移
+//   theta/phi      = 当前累积视角偏移 (累加进 orbit.userTheta/userPhi)
+//   wave 模式: 直接由双正弦算 theta/phi
+//   drift 模式: 沿 Catmull-Rom 样条弧长匀速行进, 航点滑动窗口, 无到达停顿
+//     waypoints = 航点 [{t,p}], segLen = 各段弧长近似, totalLen, cursor = 已走弧长
+//     每走过一段就追加新随机航点, 实现"一直走一直走"
+var autoOrbitState = { theta: 0, phi: 0, waypoints: [], segLen: [], totalLen: 0, cursor: 0, inited: false };
+function autoOrbitRandomWaypoint() {
+  return {
+    t: (Math.random() * 2 - 1) * 1.0,    // ±1.0 rad 水平
+    p: (Math.random() * 2 - 1) * 0.55    // ±0.55 rad 上下 (updateCamera 会再 clamp 到 ±0.45π)
+  };
+}
+// 初始化/补足航点窗口到 count 个, 并重算各段弧长
+function autoOrbitEnsureWaypoints(count) {
+  while (autoOrbitState.waypoints.length < count) {
+    autoOrbitState.waypoints.push(autoOrbitRandomWaypoint());
+  }
+  // 弧长近似: 相邻航点欧氏距离 (theta/phi 量纲接近, 够用)
+  autoOrbitState.segLen = [];
+  var total = 0;
+  for (var i = 0; i < autoOrbitState.waypoints.length - 1; i++) {
+    var a = autoOrbitState.waypoints[i], b = autoOrbitState.waypoints[i + 1];
+    var d = Math.sqrt((b.t - a.t) * (b.t - a.t) + (b.p - a.p) * (b.p - a.p));
+    autoOrbitState.segLen.push(Math.max(0.05, d));
+    total += Math.max(0.05, d);
+  }
+  autoOrbitState.totalLen = Math.max(0.1, total);
+}
+// Catmull-Rom 样条: 在航点 p0,p1,p2,p3 之间插值 (u∈[0,1]), 切线连续无停顿
+function autoOrbitCatmullRom(p0, p1, p2, p3, u) {
+  var u2 = u * u, u3 = u2 * u;
+  return {
+    t: 0.5 * ((2 * p1.t) + (-p0.t + p2.t) * u + (2 * p0.t - 5 * p1.t + 4 * p2.t - p3.t) * u2 + (-p0.t + 3 * p1.t - 3 * p2.t + p3.t) * u3),
+    p: 0.5 * ((2 * p1.p) + (-p0.p + p2.p) * u + (2 * p0.p - 5 * p1.p + 4 * p2.p - p3.p) * u2 + (-p0.p + 3 * p1.p - 3 * p2.p + p3.p) * u3)
+  };
+}
+// 按弧长 cursor 取样样条上的点 (返回 {t,p})
+function autoOrbitSampleSpline(cursor) {
+  var wp = autoOrbitState.waypoints;
+  var sl = autoOrbitState.segLen;
+  var n = wp.length;
+  if (n < 4) return wp[Math.max(0, Math.min(n - 1, Math.floor(cursor))) ] || { t: 0, p: 0 };
+  var walked = 0;
+  for (var i = 0; i < sl.length; i++) {
+    if (walked + sl[i] >= cursor || i === sl.length - 1) {
+      var segCursor = (cursor - walked) / sl[i];          // 本段内 0..1
+      segCursor = Math.max(0, Math.min(1, segCursor));
+      var p0 = wp[i - 1] || wp[i];
+      var p1 = wp[i];
+      var p2 = wp[i + 1] || wp[i];
+      var p3 = wp[i + 2] || wp[i + 1] || wp[i];
+      return autoOrbitCatmullRom(p0, p1, p2, p3, segCursor);
+    }
+    walked += sl[i];
+  }
+  return wp[n - 1];
+}
+function updateAutoOrbit(dt) {
+  if (!fx.autoOrbit || freeCamera.active || orbit.recentering || Number(fx.preset) === SKULL_PRESET_INDEX) {
+    // 关闭/冲突时把已累积的相机偏移平滑收回 baseline, 避免停在倾斜角度; 重开走全新样条
+    var decayEase = 1 - Math.pow(0.20, dt);   // 较快收回, 但不突兀
+    orbit.userTheta += (orbit.baselineTheta - orbit.userTheta) * decayEase;
+    orbit.userPhi   += (orbit.baselinePhi   - orbit.userPhi)   * decayEase;
+    autoOrbitState.theta *= Math.pow(0.06, dt);
+    autoOrbitState.phi   *= Math.pow(0.06, dt);
+    autoOrbitState.inited = false;
+    return;
+  }
+  var speed = clampRange(Number(fx.autoOrbitSpeed) || 0, 0, 2);
+  if (speed <= 0) return;
+  var beatAccel = 1 + beatPulse * 1.4;                       // 节拍加速漂移
+  var mode = fx.autoOrbitMode === 'wave' ? 'wave' : 'drift';  // drift 平滑随机 / wave 有机起伏
+  var dTheta = 0, dPhi = 0;
+
+  if (mode === 'wave') {
+    // 有机起伏循环: 双正弦李萨如曲线 (上下左右, 路径不重复)
+    var t = cinemaT;
+    var prevTheta2 = autoOrbitState.theta, prevPhi2 = autoOrbitState.phi;
+    autoOrbitState.theta = Math.sin(t * 0.13) * 0.70 + Math.sin(t * 0.31 + 1.0) * 0.25;
+    autoOrbitState.phi   = Math.sin(t * 0.09 + 2.0) * 0.40 + Math.sin(t * 0.22) * 0.15;
+    dTheta = (autoOrbitState.theta - prevTheta2) * speed * beatAccel;
+    dPhi   = (autoOrbitState.phi   - prevPhi2)   * speed * beatAccel;
+  } else { // drift — 沿 Catmull-Rom 样条弧长匀速行进, 航点滑动窗口, 无到达停顿
+    if (!autoOrbitState.inited) {
+      autoOrbitEnsureWaypoints(6);   // 预生成 6 个航点, 样条两端各有支撑点
+      autoOrbitState.cursor = 0;    // 从窗口起点开始
+      autoOrbitState.theta = autoOrbitSampleSpline(0).t;
+      autoOrbitState.phi   = autoOrbitSampleSpline(0).p;
+      autoOrbitState.inited = true;
+    }
+    // 推进游标 (弧长/秒), speed/节拍在此一次性生效 (不再二次乘到 delta)
+    var advPerSec = 0.55;                                    // 基础弧长速度
+    autoOrbitState.cursor += advPerSec * speed * beatAccel * dt;
+    // 走完整条样条: 丢弃首航点, 追加新随机航点, 游标归零 (新窗口从 waypoints[0]=旧[1] 开始, 位置连续不跳)
+    while (autoOrbitState.cursor >= autoOrbitState.totalLen) {
+      autoOrbitState.waypoints.shift();
+      autoOrbitState.waypoints.push(autoOrbitRandomWaypoint());
+      autoOrbitEnsureWaypoints(6);                          // 重算各段弧长
+      autoOrbitState.cursor -= autoOrbitState.totalLen;     // 归零 (保留本轮余量, 不会负)
+      if (autoOrbitState.cursor < 0) autoOrbitState.cursor = 0;
+    }
+    var prevTheta = autoOrbitState.theta, prevPhi = autoOrbitState.phi;
+    var sample = autoOrbitSampleSpline(autoOrbitState.cursor);
+    autoOrbitState.theta = sample.t;
+    autoOrbitState.phi   = sample.p;
+    dTheta = autoOrbitState.theta - prevTheta;   // 游标推进已含 speed/节拍, 这里只取位移
+    dPhi   = autoOrbitState.phi   - prevPhi;
+  }
+
+  orbit.userTheta += dTheta;
+  // 水平转角软上限: 到顶停住等下次反向, 防转到完全侧面 (limit 度; 0=不限)
+  var limitRad = clampRange(Number(fx.autoOrbitLimit), 0, 90) * Math.PI / 180;
+  if (limitRad > 0) orbit.userTheta = clampRange(orbit.userTheta, -limitRad, limitRad);
+  orbit.userPhi   = clampRange(orbit.userPhi + dPhi, orbit.minPhi, orbit.maxPhi);  // 上下视角不翻顶
+}
 function updateCinema(dt) {
   cinemaT += dt;
   updateBeatCamera(dt);
@@ -5224,6 +5374,8 @@ function updateCinema(dt) {
   orbit.cineTheta  = Math.sin(cinemaT * 0.08) * 0.012 * idleDamp + beatCam.thetaKick * beatDamp;
   orbit.cinePhi    = Math.sin(cinemaT * 0.06 + 1.0) * 0.010 * idleDamp + beatCam.phiKick * beatDamp;
   orbit.cineRadius = Math.sin(cinemaT * 0.04 + 2.0) * 0.080 * idleDamp - beatCam.radiusKick * beatDamp * (dj ? 1.22 : 1.18);
+  // 自动视角漂移: 两形态 (drift 平滑随机 / wave 有机起伏), 节拍加速漂移
+  updateAutoOrbit(dt);
 }
 updateCamera();
 
@@ -7625,7 +7777,14 @@ function readSavedLyricLayout() {
       shelfOpacity: clampRange(raw.shelfOpacity == null ? fxDefaults.shelfOpacity : Number(raw.shelfOpacity), 0.25, 1),
       shelfBgOpacity: clampRange(raw.shelfBgOpacity == null ? fxDefaults.shelfBgOpacity : Number(raw.shelfBgOpacity), 0.25, 0.98),
       shelfAccentColor: normalizeHexColor(raw.shelfAccentColor || fxDefaults.shelfAccentColor, fxDefaults.shelfAccentColor),
-      cam: /^(off|gesture)$/.test(String(raw.cam || '')) ? raw.cam : fxDefaults.cam
+      cam: /^(off|gesture)$/.test(String(raw.cam || '')) ? raw.cam : fxDefaults.cam,
+      autoOrbit: raw.autoOrbit === true,
+      autoOrbitMode: /^(drift|wave)$/.test(String(raw.autoOrbitMode || '')) ? raw.autoOrbitMode : fxDefaults.autoOrbitMode,
+      autoOrbitSpeed: clampRange(raw.autoOrbitSpeed == null ? fxDefaults.autoOrbitSpeed : Number(raw.autoOrbitSpeed), 0, 2),
+      autoOrbitLimit: clampRange(raw.autoOrbitLimit == null ? fxDefaults.autoOrbitLimit : Number(raw.autoOrbitLimit), 0, 90),
+      lyricFollow: clampRange(raw.lyricFollow == null ? fxDefaults.lyricFollow : Number(raw.lyricFollow), 0, 1),
+      beatZoom: raw.beatZoom === true,
+      beatZoomGain: clampRange(raw.beatZoomGain == null ? fxDefaults.beatZoomGain : Number(raw.beatZoomGain), 0, 2)
     };
   } catch (e) {
     return {};
@@ -7715,7 +7874,14 @@ function saveLyricLayout() {
       shelfOpacity: clampRange(fx.shelfOpacity == null ? fxDefaults.shelfOpacity : Number(fx.shelfOpacity), 0.25, 1),
       shelfBgOpacity: clampRange(fx.shelfBgOpacity == null ? fxDefaults.shelfBgOpacity : Number(fx.shelfBgOpacity), 0.25, 0.98),
       shelfAccentColor: normalizeHexColor(fx.shelfAccentColor || fxDefaults.shelfAccentColor, fxDefaults.shelfAccentColor),
-      cam: /^(off|gesture)$/.test(String(fx.cam || '')) ? fx.cam : fxDefaults.cam
+      cam: /^(off|gesture)$/.test(String(fx.cam || '')) ? fx.cam : fxDefaults.cam,
+      autoOrbit: !!fx.autoOrbit,
+      autoOrbitMode: /^(drift|wave)$/.test(String(fx.autoOrbitMode || '')) ? fx.autoOrbitMode : fxDefaults.autoOrbitMode,
+      autoOrbitSpeed: clampRange(fx.autoOrbitSpeed == null ? fxDefaults.autoOrbitSpeed : Number(fx.autoOrbitSpeed), 0, 2),
+      autoOrbitLimit: clampRange(fx.autoOrbitLimit == null ? fxDefaults.autoOrbitLimit : Number(fx.autoOrbitLimit), 0, 90),
+      lyricFollow: clampRange(fx.lyricFollow == null ? fxDefaults.lyricFollow : Number(fx.lyricFollow), 0, 1),
+      beatZoom: !!fx.beatZoom,
+      beatZoomGain: clampRange(fx.beatZoomGain == null ? fxDefaults.beatZoomGain : Number(fx.beatZoomGain), 0, 2)
     }));
   } catch (e) {}
 }
@@ -9130,7 +9296,14 @@ function updateStageLyrics3D(dt) {
     lyricLayoutTarget.copy(lyricLayoutBase);
     applyStageLyricLayoutOffset(lyricLayoutTarget, layoutX, layoutY, layoutZ);
     stageLyrics.group.position.copy(lyricLayoutTarget);
-    stageLyricTargetQuaternion(lyricCoverWorldQuat, layoutTiltX, layoutTiltY);
+    // 歌词半 billboard: 粒子轴 slerp 向相机轴, lyricFollow=0 纯粒子(3D感), =1 纯相机正面(不歪)
+    var lyricFollow = clampRange(Number(fx.lyricFollow) || 0, 0, 1);
+    if (lyricFollow > 0.001 && camera) {
+      lyricBaseQuat.copy(lyricCoverWorldQuat).slerp(camera.quaternion, lyricFollow);
+      stageLyricTargetQuaternion(lyricBaseQuat, layoutTiltX, layoutTiltY);
+    } else {
+      stageLyricTargetQuaternion(lyricCoverWorldQuat, layoutTiltX, layoutTiltY);
+    }
     stageLyrics.group.quaternion.copy(lyricTargetQuat);
   }
   function tickMesh(mesh, isCurrent) {
@@ -20222,7 +20395,14 @@ function normalizeFxArchiveSnapshot(raw) {
     shelfOpacity: archiveNumber(raw, 'shelfOpacity', fxDefaults.shelfOpacity, 0.25, 1),
     shelfBgOpacity: archiveNumber(raw, 'shelfBgOpacity', fxDefaults.shelfBgOpacity, 0.25, 0.98),
     shelfAccentColor: normalizeHexColor(raw.shelfAccentColor || fxDefaults.shelfAccentColor, fxDefaults.shelfAccentColor),
-    cam: archiveMode(raw, 'cam', /^(off|gesture)$/, fxDefaults.cam)
+    cam: archiveMode(raw, 'cam', /^(off|gesture)$/, fxDefaults.cam),
+    autoOrbit: raw.autoOrbit === true,
+    autoOrbitMode: archiveMode(raw, 'autoOrbitMode', /^(drift|wave)$/, fxDefaults.autoOrbitMode),
+    autoOrbitSpeed: archiveNumber(raw, 'autoOrbitSpeed', fxDefaults.autoOrbitSpeed, 0, 2),
+    autoOrbitLimit: archiveNumber(raw, 'autoOrbitLimit', fxDefaults.autoOrbitLimit, 0, 90),
+    lyricFollow: archiveNumber(raw, 'lyricFollow', fxDefaults.lyricFollow, 0, 1),
+    beatZoom: raw.beatZoom === true,
+    beatZoomGain: archiveNumber(raw, 'beatZoomGain', fxDefaults.beatZoomGain, 0, 2)
   };
 }
 function readUserFxArchives() {
@@ -21356,7 +21536,7 @@ function setRange(id, value) {
   var out = el.parentElement.querySelector('output');
   if (out) out.textContent = id === 'fx-coverres'
     ? coverParticleCountLabel(value)
-    : (id === 'fx-lyricweight' || id === 'fx-glassaberration' || id === 'fx-lyrictiltx' || id === 'fx-lyrictilty' || id === 'fx-shelfangle' ? String(Math.round(Number(value) || 0)) : Number(value).toFixed(id === 'fx-lyricspacing' ? 3 : 2));
+    : (id === 'fx-lyricweight' || id === 'fx-glassaberration' || id === 'fx-lyrictiltx' || id === 'fx-lyrictilty' || id === 'fx-shelfangle' || id === 'fx-autoorbitlimit' ? String(Math.round(Number(value) || 0)) : Number(value).toFixed(id === 'fx-lyricspacing' ? 3 : 2));
 }
 function updateDevelopmentFxControls() {
   [
@@ -21474,6 +21654,10 @@ function updateFxInputs() {
   setRange('fx-bloom', fx.bloomStrength);
   setRange('fx-scatter', fx.scatter);
   setRange('fx-bgfade', fx.bgFade);
+  setRange('fx-autoorbitspeed', fx.autoOrbitSpeed == null ? fxDefaults.autoOrbitSpeed : fx.autoOrbitSpeed);
+  setRange('fx-autoorbitlimit', fx.autoOrbitLimit == null ? fxDefaults.autoOrbitLimit : fx.autoOrbitLimit);
+  setRange('fx-lyricfollow', fx.lyricFollow == null ? fxDefaults.lyricFollow : fx.lyricFollow);
+  setRange('fx-beatzoomgain', fx.beatZoomGain == null ? fxDefaults.beatZoomGain : fx.beatZoomGain);
   updateLyricGlowControls();
   // 同步开关
   document.getElementById('t-float').classList.toggle('on', fx.floatLayer);
@@ -21507,6 +21691,10 @@ function updateFxInputs() {
   if (shelfMergeToggle) shelfMergeToggle.classList.toggle('on', fx.shelfMergeCollections === true);
   var liveBackgroundKeepToggle = document.getElementById('t-liveBackgroundKeep');
   if (liveBackgroundKeepToggle) liveBackgroundKeepToggle.classList.toggle('on', fx.liveBackgroundKeep === true);
+  var autoOrbitToggle = document.getElementById('t-autoOrbit');
+  if (autoOrbitToggle) autoOrbitToggle.classList.toggle('on', fx.autoOrbit === true);
+  var beatZoomToggle = document.getElementById('t-beatZoom');
+  if (beatZoomToggle) beatZoomToggle.classList.toggle('on', fx.beatZoom === true);
   updatePerformanceControls();
   updateDevelopmentFxControls();
   var aiDepthToggle = document.getElementById('t-aidepth');
@@ -21515,6 +21703,7 @@ function updateFxInputs() {
   document.querySelectorAll('#shelf-seg button').forEach(function(b){ b.classList.toggle('active', b.dataset.shelf === fx.shelf); });
   updateShelfControlUi();
   document.querySelectorAll('#cam-seg button').forEach(function(b){ b.classList.toggle('active', b.dataset.cam === fx.cam); });
+  document.querySelectorAll('#autoorbit-mode-seg button').forEach(function(b){ b.classList.toggle('active', b.dataset.autoorbitMode === (fx.autoOrbitMode || 'drift')); });
   refreshPresetGrid();
   updateLyricColorControls();
   updateLyricHighlightControls();
@@ -22153,6 +22342,7 @@ function bindFxPanel() {
     ['fx-lyricscale','lyricScale'],['fx-lyricx','lyricOffsetX'],['fx-lyricy','lyricOffsetY'],['fx-lyricz','lyricOffsetZ'],['fx-lyrictiltx','lyricTiltX'],['fx-lyrictilty','lyricTiltY'],
     ['fx-point','point'],['fx-speed','speed'],['fx-twist','twist'],
     ['fx-color','color'],['fx-bloom','bloomStrength'],['fx-scatter','scatter'],['fx-bgfade','bgFade'],
+    ['fx-autoorbitspeed','autoOrbitSpeed'],['fx-autoorbitlimit','autoOrbitLimit'],['fx-lyricfollow','lyricFollow'],['fx-beatzoomgain','beatZoomGain'],
   ];
   ids.forEach(function(pair){
     var el = document.getElementById(pair[0]);
@@ -22191,9 +22381,13 @@ function bindFxPanel() {
       if (pair[1] === 'shelfOpacity') fx.shelfOpacity = clampRange(fx.shelfOpacity, 0.25, 1);
       if (pair[1] === 'shelfBgOpacity') fx.shelfBgOpacity = clampRange(fx.shelfBgOpacity, 0.25, 0.98);
       if (pair[1] === 'lyricTiltX' || pair[1] === 'lyricTiltY') fx[pair[1]] = Math.round(clampRange(fx[pair[1]], -42, 42));
+      if (pair[1] === 'autoOrbitSpeed') fx.autoOrbitSpeed = clampRange(fx.autoOrbitSpeed, 0, 2);
+      if (pair[1] === 'autoOrbitLimit') fx.autoOrbitLimit = Math.round(clampRange(fx.autoOrbitLimit, 0, 90));
+      if (pair[1] === 'lyricFollow') fx.lyricFollow = clampRange(fx.lyricFollow, 0, 1);
+      if (pair[1] === 'beatZoomGain') fx.beatZoomGain = clampRange(fx.beatZoomGain, 0, 2);
       if (out) out.textContent = pair[1] === 'coverResolution'
         ? coverParticleCountLabel(fx.coverResolution)
-        : (pair[1] === 'lyricWeight' || pair[1] === 'controlGlassChromaticOffset' || pair[1] === 'lyricTiltX' || pair[1] === 'lyricTiltY' || pair[1] === 'shelfAngleY' ? String(Math.round(fx[pair[1]])) : Number(el.value).toFixed(pair[1] === 'lyricLetterSpacing' ? 3 : 2));
+        : (pair[1] === 'lyricWeight' || pair[1] === 'controlGlassChromaticOffset' || pair[1] === 'lyricTiltX' || pair[1] === 'lyricTiltY' || pair[1] === 'shelfAngleY' || pair[1] === 'autoOrbitLimit' ? String(Math.round(fx[pair[1]])) : Number(el.value).toFixed(pair[1] === 'lyricLetterSpacing' ? 3 : 2));
       syncFxUniforms();
       if (/^shelf(Size|OffsetX|OffsetY|OffsetZ|AngleY|Opacity|BgOpacity)$/.test(pair[1]) && shelfManager && shelfManager.refreshTheme) shelfManager.refreshTheme();
       if (pair[1] === 'lyricLetterSpacing' || pair[1] === 'lyricLineHeight' || pair[1] === 'lyricWeight') refreshCurrentLyricStyle();
@@ -22336,6 +22530,9 @@ function bindFxPanel() {
   document.querySelectorAll('#cam-seg button').forEach(function(b){
     b.addEventListener('click', function(){ setCamMode(b.dataset.cam); });
   });
+  document.querySelectorAll('#autoorbit-mode-seg button').forEach(function(b){
+    b.addEventListener('click', function(){ setAutoOrbitMode(b.dataset.autoorbitMode); });
+  });
   document.querySelectorAll('#desktop-lyrics-fps-seg [data-desktop-lyrics-fps]').forEach(function(btn){
     btn.addEventListener('click', function(){
       fx.desktopLyricsFps = normalizeDesktopLyricsFps(btn.getAttribute('data-desktop-lyrics-fps'));
@@ -22372,7 +22569,7 @@ function toggleFx(key) {
   var toggle = document.getElementById(toggleId);
   if (toggle) toggle.classList.toggle('on', fx[key]);
   syncFxUniforms();
-  if (key === 'lyricCameraLock' || key === 'lyricGlow' || key === 'lyricGlowBeat' || key === 'lyricGlowParticles' || key === 'bloom' || key === 'edge' || key === 'cinema' || key === 'desktopLyrics' || key === 'desktopLyricsClickThrough' || key === 'desktopLyricsCinema' || key === 'desktopLyricsHighlight' || key === 'wallpaperMode' || key === 'shelfShowPodcasts' || key === 'shelfMergeCollections' || key === 'liveBackgroundKeep') saveLyricLayout();
+  if (key === 'lyricCameraLock' || key === 'lyricGlow' || key === 'lyricGlowBeat' || key === 'lyricGlowParticles' || key === 'bloom' || key === 'edge' || key === 'cinema' || key === 'desktopLyrics' || key === 'desktopLyricsClickThrough' || key === 'desktopLyricsCinema' || key === 'desktopLyricsHighlight' || key === 'wallpaperMode' || key === 'shelfShowPodcasts' || key === 'shelfMergeCollections' || key === 'liveBackgroundKeep' || key === 'autoOrbit' || key === 'beatZoom') saveLyricLayout();
   if (key === 'floatLayer') { if (fx.floatLayer) createFloatLayer(); else destroyFloatLayer(); }
   if (key === 'desktopLyrics') applyDesktopLyricsState(true);
   if (key === 'desktopLyricsClickThrough' || key === 'desktopLyricsCinema' || key === 'desktopLyricsHighlight') pushDesktopLyricsState(true);
@@ -22409,6 +22606,8 @@ function toggleFx(key) {
   if (key === 'bloom') showToast(fx.bloom ? '溢光已开启' : '溢光已关闭');
   if (key === 'edge') showToast(fx.edge ? '已开启轮廓高亮' : '已关闭轮廓高亮');
   if (key === 'cinema') showToast(fx.cinema ? '已开启电影镜头' : '已关闭电影镜头');
+  if (key === 'autoOrbit') showToast(fx.autoOrbit ? '自动旋转已开启' : '自动旋转已关闭');
+  if (key === 'beatZoom') showToast(fx.beatZoom ? '律动推拉已开启' : '律动推拉已关闭');
   if (key === 'aiDepth') {
     if (fx.aiDepth) {
       aiDepthFailUntil = 0;
@@ -22632,6 +22831,21 @@ function setCamMode(m) {
   document.querySelectorAll('#cam-seg button').forEach(function(b){ b.classList.toggle('active', b.dataset.cam === m); });
   if (m === 'off') stopGestureControl();
   else if (m === 'gesture') startGestureControl();
+  saveLyricLayout();
+}
+function setAutoOrbitMode(m) {
+  if (m !== 'drift' && m !== 'wave') m = 'drift';   // 残留的 pulse 旧存档回落到 drift
+  fx.autoOrbitMode = m;
+  autoOrbitState.theta = 0;   // 切形态时重置累积, 避免上一形态残留跳变
+  autoOrbitState.phi = 0;
+  autoOrbitState.waypoints = [];   // drift 航点窗口清空, 下帧重建 (新样条路径)
+  autoOrbitState.segLen = [];
+  autoOrbitState.totalLen = 0;
+  autoOrbitState.cursor = 0;
+  autoOrbitState.inited = false;
+  document.querySelectorAll('#autoorbit-mode-seg button').forEach(function(b){ b.classList.toggle('active', b.dataset.autoorbitMode === m); });
+  var label = m === 'wave' ? '起伏循环' : '随机漂移';
+  showToast('视角漂移: ' + label);
   saveLyricLayout();
 }
 

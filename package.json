@@ -9,7 +9,8 @@
   "scripts": {
     "start": "electron .",
     "build:win": "electron-builder --win nsis",
-    "build:win:dir": "electron-builder --win dir"
+    "build:win:dir": "electron-builder --win dir",
+    "postinstall": "node scripts/install-electron-fallback.js && node scripts/patch-builder-esm.js"
   },
   "build": {
     "appId": "com.mineradio.desktop",
